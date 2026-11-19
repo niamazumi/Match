@@ -1,29 +1,32 @@
 #!/usr/bin/env python3
 """
-Matchs du jour = matchs proposés par WinnerBet + statistiques SoccerSTATS.com
+Matchs du jour = matchs proposés par WinnerBet + statistiques football-data.org
 """
 
 import difflib
+import json
 import os
 import re
 import smtplib
 import sys
 import time
 import unicodedata
+import urllib.error
 import urllib.parse
 import urllib.request
 import webbrowser
 from datetime import date, datetime, timedelta
 from email.message import EmailMessage
 from html import escape
-from html.parser import HTMLParser
 
 # ====================== RÉGLAGES (modifiables) ======================
 SEUIL_PLUS_1_5 = 0.75   # conditions 1, 2 et 3
 SEUIL_BTTS = 0.75       # "les deux équipes marquent" : taux minimum
 MIN_MATCHS = 5          # nombre minimal de matchs joués pour fiabiliser les taux
-JOUR = 1                # 1 = aujourd'hui, 2 = demain (numérotation SoccerSTATS)
+JOUR = 0                # 0 = aujourd'hui, 1 = demain (date de Kinshasa)
 URL_WINNER = "https://winner.bet/fr/sports"   # à corriger si l'adresse diffère
+
+API_KEY = os.environ.get("FOOTBALL_DATA_KEY", "")   # clé football-data.org (secret GitHub)
 
 # Envoi automatique (laissez vide ce que vous n'utilisez pas)
 EMAIL_ENVOI = os.environ.get("EMAIL_ENVOI", "")
@@ -33,7 +36,7 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 PAGE_URL = os.environ.get("PAGE_URL", "")   # adresse de votre page web (GitHub Pages)
 
-# Noms différents entre SoccerSTATS et WinnerBet : "nom SoccerSTATS": "nom WinnerBet"
+# Noms différents entre les deux sources : "nom football-data": "nom WinnerBet"
 ALIAS = {
     "Paris SG": "Paris Saint-Germain",
     "Man Utd": "Manchester United",
@@ -42,109 +45,84 @@ ALIAS = {
 }
 # ====================================================================
 
-URL_DOM_EXT = f"https://www.soccerstats.com/matches.asp?matchday={JOUR}"
-URL_TOUS = f"https://www.soccerstats.com/matches.asp?matchday={100 + JOUR}"
 DOSSIER = os.path.dirname(os.path.abspath(__file__))
+BASE = "https://api.football-data.org/v4"
 
 
-# ---------------------------- SoccerSTATS ----------------------------
-class LecteurTableaux(HTMLParser):
-    def __init__(self):
-        super().__init__()
-        self.lignes, self.cellule, self.dans_cellule = [[]], [], False
-
-    def handle_starttag(self, tag, attrs):
-        if tag == "tr":
-            self.lignes.append([])
-        elif tag in ("td", "th"):
-            self.dans_cellule, self.cellule = True, []
-
-    def handle_endtag(self, tag):
-        if tag in ("td", "th") and self.dans_cellule:
-            self.lignes[-1].append(" ".join("".join(self.cellule).split()))
-            self.dans_cellule = False
-
-    def handle_data(self, data):
-        if self.dans_cellule:
-            self.cellule.append(data)
+# ------------------------- football-data.org -------------------------
+def appel(chemin):
+    req = urllib.request.Request(BASE + chemin, headers={"X-Auth-Token": API_KEY})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            data = json.load(r)
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"football-data.org a répondu {e.code} pour {chemin}")
+    time.sleep(6.5)  # offre gratuite : 10 requêtes par minute
+    return data
 
 
-def telecharger(url):
-    """Ouvre la page avec un vrai navigateur (le site refuse les programmes simples)."""
-    from playwright.sync_api import sync_playwright
-    with sync_playwright() as pw:
-        nav = pw.chromium.launch(headless=True)
-        ctx = nav.new_context(
-            locale="en-US", viewport={"width": 1280, "height": 900},
-            user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                        "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"))
-        page = ctx.new_page()
-        rep = page.goto(url, wait_until="domcontentloaded", timeout=60000)
-        page.wait_for_timeout(4000)
-        html = page.content()
-        statut = rep.status if rep else 0
-        nav.close()
-    if statut >= 400:
-        raise RuntimeError(f"SoccerSTATS a refusé l'accès (code {statut}) : {url}")
-    return html
+def taux(liste, test):
+    return sum(1 for m in liste if test(m)) / len(liste) if liste else 0.0
 
 
-def pct(texte):
-    m = re.fullmatch(r"(\d+)%", texte.strip())
-    return int(m.group(1)) / 100 if m else None
+def plus_1_5(m):
+    return m[0] + m[1] >= 2
 
 
-def extraire_equipes(html):
-    p = LecteurTableaux()
-    p.feed(html)
-    equipes, ligue = [], ""
-    for cellules in p.lignes:
-        m = re.search(r"(\S.*?)\s+stats\s+Matches played", " ".join(cellules))
-        if m:
-            ligue = m.group(1).strip()
-        for i, c in enumerate(cellules):
-            if c in ("home", "away"):
-                stats = cellules[i + 1:]
-                if len(stats) < 11 or not stats[0].isdigit():
-                    break
-                avant = " ".join(cellules[:i])
-                heure = re.search(r"\d\d:\d\d", avant)
-                nom = re.sub(r"\d\d:\d\d", "", avant).replace("stats", "").strip()
-                equipes.append({
-                    "ligue": ligue, "nom": nom, "role": c,
-                    "heure": heure.group(0) if heure else "",
-                    "gp": int(stats[0]), "bts": pct(stats[4]), "p15": pct(stats[8]),
-                })
-                break
-    return equipes
+def btts(m):
+    return m[0] > 0 and m[1] > 0
 
 
-def paires(equipes):
-    return [(equipes[i], equipes[i + 1]) for i in range(len(equipes) - 1)
-            if equipes[i]["role"] == "home" and equipes[i + 1]["role"] == "away"]
+def heure_kinshasa(utc):
+    d = datetime.strptime(utc, "%Y-%m-%dT%H:%M:%SZ") + timedelta(hours=1)
+    return d.strftime("%H:%M")
+
+
+def evaluer(matchs_du_jour, termines):
+    """Applique vos conditions. termines = liste de (id_dom, id_ext, buts_dom, buts_ext)."""
+    domicile, exterieur = {}, {}
+    for idh, ida, gh, ga in termines:
+        domicile.setdefault(idh, []).append((gh, ga))
+        exterieur.setdefault(ida, []).append((gh, ga))
+    retenus = []
+    for m in matchs_du_jour:
+        h, a = m["homeTeam"]["id"], m["awayTeam"]["id"]
+        h_dom, a_ext = domicile.get(h, []), exterieur.get(a, [])
+        h_tous = h_dom + exterieur.get(h, [])
+        a_tous = a_ext + domicile.get(a, [])
+        if min(len(h_dom), len(a_ext)) < MIN_MATCHS:
+            continue
+        c1, c2 = taux(h_dom, plus_1_5), taux(a_ext, plus_1_5)
+        c3h, c3a = taux(h_tous, plus_1_5), taux(a_tous, plus_1_5)
+        bh, ba = taux(h_tous, btts), taux(a_tous, btts)
+        if (c1 >= SEUIL_PLUS_1_5 and c2 >= SEUIL_PLUS_1_5
+                and c3h >= SEUIL_PLUS_1_5 and c3a >= SEUIL_PLUS_1_5
+                and bh >= SEUIL_BTTS and ba >= SEUIL_BTTS):
+            retenus.append({
+                "ligue": m["competition"]["name"], "heure": heure_kinshasa(m["utcDate"]),
+                "domicile": m["homeTeam"]["name"], "exterieur": m["awayTeam"]["name"],
+                "c1": c1, "c2": c2, "c3h": c3h, "c3a": c3a, "btts_h": bh, "btts_a": ba,
+            })
+    return retenus
 
 
 def candidats_soccerstats():
-    dom_ext = paires(extraire_equipes(telecharger(URL_DOM_EXT)))
-    tous = {(h["nom"], a["nom"]): (h, a)
-            for h, a in paires(extraire_equipes(telecharger(URL_TOUS)))}
+    if not API_KEY:
+        raise RuntimeError("Clé FOOTBALL_DATA_KEY absente (secret GitHub à créer).")
+    jour = (datetime.utcnow() + timedelta(hours=1, days=JOUR)).date().isoformat()
+    data = appel(f"/matches?dateFrom={jour}&dateTo={jour}")
+    par_ligue = {}
+    for m in data["matches"]:
+        if m["status"] in ("TIMED", "SCHEDULED"):
+            par_ligue.setdefault(m["competition"]["code"], []).append(m)
     retenus = []
-    for h, a in dom_ext:
-        if (h["nom"], a["nom"]) not in tous:
-            continue
-        ht, at = tous[(h["nom"], a["nom"])]
-        v = [h["p15"], a["p15"], ht["p15"], at["p15"], ht["bts"], at["bts"]]
-        if None in v or min(h["gp"], a["gp"], ht["gp"], at["gp"]) < MIN_MATCHS:
-            continue
-        if (h["p15"] >= SEUIL_PLUS_1_5 and a["p15"] >= SEUIL_PLUS_1_5
-                and ht["p15"] >= SEUIL_PLUS_1_5 and at["p15"] >= SEUIL_PLUS_1_5
-                and ht["bts"] >= SEUIL_BTTS and at["bts"] >= SEUIL_BTTS):
-            retenus.append({
-                "ligue": h["ligue"], "heure": h["heure"],
-                "domicile": h["nom"], "exterieur": a["nom"],
-                "c1": h["p15"], "c2": a["p15"], "c3h": ht["p15"], "c3a": at["p15"],
-                "btts_h": ht["bts"], "btts_a": at["bts"],
-            })
+    for code, matchs in par_ligue.items():
+        print(f"    {code} : {len(matchs)} match(s) aujourd'hui")
+        finis = appel(f"/competitions/{code}/matches?status=FINISHED")["matches"]
+        termines = [(f["homeTeam"]["id"], f["awayTeam"]["id"],
+                     f["score"]["fullTime"]["home"], f["score"]["fullTime"]["away"])
+                    for f in finis if f["score"]["fullTime"]["home"] is not None]
+        retenus += evaluer(matchs, termines)
     return retenus
 
 
@@ -239,7 +217,7 @@ td,th{{border:1px solid #ccc;padding:6px;font-size:14px}}th{{background:#eee}}</
 <h2>Matchs retenus (disponibles chez WinnerBet) - {jour}</h2>
 <table><tr><th>Ligue</th><th>Heure (site)</th><th>Match</th><th>Dom. +1,5</th><th>Ext. +1,5</th>
 <th>Tous matchs +1,5 (dom / ext)</th><th>Les deux marquent (dom / ext)</th></tr>{lignes}</table>
-<p>Statistiques SoccerSTATS.com. Ce ne sont pas des garanties de gain. Jouez avec modération.</p></html>"""
+<p>Statistiques football-data.org. Ce ne sont pas des garanties de gain. Jouez avec modération.</p></html>"""
 
 
 def message_texte(resultats, jour):
@@ -284,7 +262,7 @@ def lancer():
     print(f"    {len(lignes_winner)} lignes lues (copie dans winner_page.txt)")
     if len(lignes_winner) < 30:
         print("    ATTENTION : très peu de texte lu, WinnerBet bloque peut-être la lecture.")
-    print("2/3 Statistiques SoccerSTATS...")
+    print("2/3 Statistiques football-data.org...")
     candidats = candidats_soccerstats()
     print(f"    {len(candidats)} match(s) respectent les conditions statistiques")
     print("3/3 Vérification : le match existe chez WinnerBet ?")
