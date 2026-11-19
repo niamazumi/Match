@@ -70,9 +70,23 @@ class LecteurTableaux(HTMLParser):
 
 
 def telecharger(url):
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    with urllib.request.urlopen(req, timeout=30) as r:
-        return r.read().decode("utf-8", errors="replace")
+    """Ouvre la page avec un vrai navigateur (le site refuse les programmes simples)."""
+    from playwright.sync_api import sync_playwright
+    with sync_playwright() as pw:
+        nav = pw.chromium.launch(headless=True)
+        ctx = nav.new_context(
+            locale="en-US", viewport={"width": 1280, "height": 900},
+            user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                        "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"))
+        page = ctx.new_page()
+        rep = page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        page.wait_for_timeout(4000)
+        html = page.content()
+        statut = rep.status if rep else 0
+        nav.close()
+    if statut >= 400:
+        raise RuntimeError(f"SoccerSTATS a refusé l'accès (code {statut}) : {url}")
+    return html
 
 
 def pct(texte):
