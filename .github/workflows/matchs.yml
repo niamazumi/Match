@@ -14,16 +14,22 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install playwright && playwright install --with-deps chromium
-      - run: python matchs_du_jour.py
+      - name: Lancer le programme
+        shell: bash
+        run: python matchs_du_jour.py 2>&1 | tee log.txt
         env:
+          FOOTBALL_DATA_KEY: ${{ secrets.FOOTBALL_DATA_KEY }}
           PAGE_URL: ${{ vars.PAGE_URL }}
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           EMAIL_ENVOI: ${{ secrets.EMAIL_ENVOI }}
           EMAIL_MOT_DE_PASSE: ${{ secrets.EMAIL_MOT_DE_PASSE }}
           EMAIL_DESTINATAIRE: ${{ secrets.EMAIL_DESTINATAIRE }}
+      - name: Afficher l'erreur
+        if: failure()
+        run: echo "::error::$(tail -n 8 log.txt | tr '\n' ' ')"
       - name: Publier la page web
-        if: always()
+        if: always() && hashFiles('matchs_du_jour.html') != ''
         run: |
           mkdir -p docs
           cp matchs_du_jour.html docs/index.html
